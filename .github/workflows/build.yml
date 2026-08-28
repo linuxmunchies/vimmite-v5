@@ -1,4 +1,4 @@
-name: Vimmite V4 image
+name: Vimmite V5 image
 on:
   schedule:
     - cron:
@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   bluebuild:
-    name: Build and publish Vimmite V4
+    name: Build and publish Vimmite V5
     runs-on: ubuntu-latest
     permissions:
       contents: read

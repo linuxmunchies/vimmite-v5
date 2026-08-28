@@ -35,7 +35,7 @@ These are confirmed requirements. Their old implementation is not approved.
 - Zsh as the preferred interactive shell, using Zim rather than Vimmite's
   generated `zsh-kick` configuration.
 - Firefox as a guaranteed browser and Brave delivered as a Flatpak.
-- The declared Vimmite V4 GUI application set on every machine.
+- The declared Vimmite V5 GUI application set on every machine.
 - Multimedia playback/creation and the codecs needed by the retained
   applications, implemented appropriately for the selected base.
 

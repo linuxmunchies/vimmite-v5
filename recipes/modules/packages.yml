@@ -9,24 +9,27 @@ install:
     - git
     - vim-enhanced
     - neovim
-    - bat
     - kitty
-    - ncdu
-    - fd-find
+    - inxi
+    - unzip
+    - rclone
+    - tmux
+    - tree
     - tldr
     - lsd
-    - inxi
-    - jq
-    - unzip
 
-    # Media tools retained from the existing recipe
+    # Storage, health, and hardware diagnostics
+    - rsync
+    - smartmontools
+    - nvme-cli
+    - lm_sensors
+
+    # Media tools
     - vlc
     - mpv
-    - yt-dlp
     - mediainfo
     - mixxx
     - flac
 
     # Container tooling; Distrobox and Podman are already supplied by the base
     - podman-compose
-
