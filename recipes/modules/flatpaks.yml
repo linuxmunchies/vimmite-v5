@@ -18,7 +18,7 @@ configurations:
       - md.obsidian.Obsidian
       - dev.zed.Zed
       - org.telegram.desktop
-      - dev.vencord.Vesktop
+      - org.equicord.equibop
       - org.signal.Signal
       - re.fossplant.songrec
 
@@ -46,6 +46,7 @@ configurations:
       - com.rustdesk.RustDesk
       - it.mijorus.gearlever
       - com.github.zocker_160.SyncThingy
+      - org.filezillaproject.Filezilla
 
   # Keep a user Flathub remote for optional applications without showing a
   # misleading "installed 0 user Flatpaks" notification after every login.
