@@ -1,4 +1,5 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
+set positional-arguments
 
 [doc('Install the image-baked Zim setup without overwriting shell configuration')]
 [group('Vimmite')]
@@ -300,3 +301,233 @@ setup-ai-max action="status":
             exit 2
             ;;
     esac
+
+# RamaLama is installed per user so it works on the immutable image without
+# layering packages or changing the host configuration.
+ramalama_store := env_var_or_default("RAMALAMA_STORE", env_var("HOME") + "/ai/models")
+ramalama_cli_dir := env_var_or_default("RAMALAMA_CLI_DIR", env_var("HOME") + "/.local/share/ramalama-cli")
+ramalama_bin := env_var_or_default("RAMALAMA_BIN", ramalama_cli_dir + "/bin/ramalama")
+ramalama_user_bin_dir := env_var_or_default("RAMALAMA_USER_BIN_DIR", env_var("HOME") + "/.local/bin")
+ramalama_backend := env_var_or_default("RAMALAMA_BACKEND", "vulkan")
+ramalama_ngl := env_var_or_default("RAMALAMA_NGL", "auto")
+ramalama_context_tokens := env_var_or_default("RAMALAMA_CONTEXT", "4096")
+
+# Each Hugging Face transport selects exactly one GGUF quantization.
+ramalama_qwen := "hf://unsloth/Qwen3.5-35B-A3B-GGUF:UD-Q4_K_XL"
+ramalama_ornith := "hf://ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M"
+ramalama_gemma := "hf://unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL"
+ramalama_laguna := "hf://ggml-org/Laguna-XS-2.1-GGUF:Q4_K_M"
+ramalama_granite := "hf://bartowski/granite-4.2-8b-GGUF:Q4_K_M"
+ramalama_nemotron := "hf://unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-Q4_K_XL"
+ramalama_liquid := "hf://LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
+ramalama_north := "hf://unsloth/North-Mini-Code-1.0-GGUF:UD-Q4_K_M"
+
+[private]
+_ramalama-require:
+    #!/usr/bin/env bash
+    if [[ ! -x "{{ ramalama_bin }}" ]]; then
+        echo "RamaLama is not installed in {{ ramalama_cli_dir }}." >&2
+        echo "Run: ujust ramalama-setup" >&2
+        exit 1
+    fi
+
+[private]
+_ramalama-check-all-space:
+    #!/usr/bin/env bash
+    # The requested GGUF payloads total about 120 GiB before optional
+    # projectors, OCI images, and metadata. Retain a modest safety margin.
+    probe="{{ ramalama_store }}"
+    while [[ ! -e "${probe}" ]]; do
+        probe="$(dirname "${probe}")"
+    done
+    available_kib="$(df -Pk "${probe}" | awk 'NR == 2 { print $4 }')"
+    minimum_kib=$((145 * 1024 * 1024))
+    if (( available_kib < minimum_kib )); then
+        available_gib=$((available_kib / 1024 / 1024))
+        echo "Need at least 145 GiB free for ramalama-pull-all; only ${available_gib} GiB is free." >&2
+        echo "Set RAMALAMA_STORE to a larger filesystem, or pull individual models." >&2
+        exit 1
+    fi
+
+[doc('Check the non-destructive prerequisites for AMD Vulkan inference')]
+[group('RamaLama')]
+ramalama-preflight:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    command -v podman >/dev/null || { echo "Podman is required." >&2; exit 1; }
+    command -v python3 >/dev/null || { echo "python3 is required." >&2; exit 1; }
+    command -v jq >/dev/null || { echo "jq is required." >&2; exit 1; }
+
+    echo "Podman rootless: $(podman info --format json | jq -r '.host.security.rootless')"
+    if [[ -r /dev/dri/renderD128 ]]; then
+        echo "DRM render node: readable (/dev/dri/renderD128)"
+    else
+        echo "WARNING: /dev/dri/renderD128 is not readable; Vulkan container access may fail." >&2
+    fi
+
+    if command -v vulkaninfo >/dev/null; then
+        vulkan_summary="$(vulkaninfo --summary 2>&1 || true)"
+        if grep -Eqi 'AMD.*Radeon|Radeon.*AMD' <<<"${vulkan_summary}"; then
+            echo "Vulkan: AMD device detected"
+        else
+            echo "WARNING: vulkaninfo did not report an AMD Radeon device." >&2
+        fi
+    else
+        echo "WARNING: vulkaninfo is unavailable; install the Vulkan tools only if you need this diagnostic." >&2
+    fi
+
+    available_mem_kib="$(awk '/MemAvailable:/ { print $2 }' /proc/meminfo)"
+    available_mem_gib=$((available_mem_kib / 1024 / 1024))
+    echo "Available RAM: ${available_mem_gib} GiB"
+    echo "Model store: {{ ramalama_store }}"
+    echo "Backend: {{ ramalama_backend }}; GPU layers: {{ ramalama_ngl }}; context: {{ ramalama_context_tokens }}"
+
+[doc('Install/update RamaLama and Hugging Face CLI without downloading models')]
+[group('RamaLama')]
+ramalama-install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ ! -x "{{ ramalama_cli_dir }}/bin/python" ]]; then
+        python3 -m venv "{{ ramalama_cli_dir }}"
+    fi
+    "{{ ramalama_cli_dir }}/bin/python" -m pip install --upgrade pip
+    "{{ ramalama_cli_dir }}/bin/python" -m pip install --upgrade ramalama 'huggingface_hub[cli]'
+
+    # Keep the executable at a conventional user-local path. The symlink is
+    # updated on every install/update, so it follows future upgrades.
+    mkdir -p "{{ ramalama_user_bin_dir }}"
+    ln -sfn "{{ ramalama_bin }}" "{{ ramalama_user_bin_dir }}/ramalama"
+
+    # ujust cannot alter its caller's environment. Ensure new Zsh terminals
+    # find the standard user-local bin directory.
+    zshrc="${HOME}/.zshrc"
+    path_line='export PATH="$HOME/.local/bin:$PATH"'
+    if ! [[ -f "${zshrc}" ]] || ! grep -Fqx "${path_line}" "${zshrc}"; then
+        {
+            echo
+            echo '# RamaLama command path (managed by Vimmite)'
+            echo "${path_line}"
+        } >> "${zshrc}"
+        echo "Added ~/.local/bin to ${zshrc}; open a new terminal to use 'ramalama'."
+    fi
+
+    "{{ ramalama_bin }}" version
+    echo "Installed without sudo. 'ramalama' is available at {{ ramalama_user_bin_dir }}/ramalama."
+    echo "Models will be stored in: {{ ramalama_store }}"
+
+[doc('Set up RamaLama only: install the CLI and do not download any model')]
+[group('RamaLama')]
+ramalama-setup: ramalama-preflight ramalama-install
+    @echo "RamaLama is ready without models. Run an individual ramalama-pull-* recipe when wanted."
+
+[doc('List models already present in the configured RamaLama model store')]
+[group('RamaLama')]
+ramalama-list: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" list
+
+[doc('Download Qwen3.5 35B-A3B, Unsloth Dynamic Q4_K_XL')]
+[group('RamaLama pulls')]
+ramalama-pull-qwen: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" pull "{{ ramalama_qwen }}"
+
+[doc('Download Ornith 1.5 9B, Q4_K_M')]
+[group('RamaLama pulls')]
+ramalama-pull-ornith: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" pull "{{ ramalama_ornith }}"
+
+[doc('Download Gemma 4 26B-A4B, Unsloth Dynamic Q4_K_XL')]
+[group('RamaLama pulls')]
+ramalama-pull-gemma: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" pull "{{ ramalama_gemma }}"
+
+[doc('Download Laguna XS 2.1, Q4_K_M')]
+[group('RamaLama pulls')]
+ramalama-pull-laguna: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" pull "{{ ramalama_laguna }}"
+
+[doc('Download Granite 4.2 8B, Q4_K_M')]
+[group('RamaLama pulls')]
+ramalama-pull-granite: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" pull "{{ ramalama_granite }}"
+
+[doc('Download NVIDIA Nemotron 3.5 Lightning 30B-A3B, Unsloth Dynamic Q4_K_XL')]
+[group('RamaLama pulls')]
+ramalama-pull-nemotron: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" pull "{{ ramalama_nemotron }}"
+
+[doc('Download Liquid LFM2.5 8B-A1B, Q4_K_M')]
+[group('RamaLama pulls')]
+ramalama-pull-liquid: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" pull "{{ ramalama_liquid }}"
+
+[doc('Download Cohere North Mini Code 1.0, Unsloth Dynamic Q4_K_M')]
+[group('RamaLama pulls')]
+ramalama-pull-north: _ramalama-require
+    "{{ ramalama_bin }}" --store "{{ ramalama_store }}" pull "{{ ramalama_north }}"
+
+[doc('Download every requested model after confirming a 145 GiB free-space safety margin')]
+[group('RamaLama pulls')]
+ramalama-pull-all: _ramalama-check-all-space ramalama-pull-qwen ramalama-pull-ornith ramalama-pull-gemma ramalama-pull-laguna ramalama-pull-granite ramalama-pull-nemotron ramalama-pull-liquid ramalama-pull-north
+    @echo "All requested pulls finished. Use ramalama-list to review the local store."
+
+[doc('Set up RamaLama and download every requested model (at least 145 GiB free)')]
+[group('RamaLama')]
+ramalama-setup-all: ramalama-preflight ramalama-install ramalama-pull-all
+    @echo "RamaLama and all requested models are ready. Run ramalama-smoke next."
+
+[doc('Run a short real Vulkan smoke test after confirming the Liquid model is already local')]
+[group('RamaLama')]
+ramalama-smoke: _ramalama-require
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "This checks the Vulkan container path with a 2K context and 24 generated tokens."
+    echo "It requires ramalama-pull-liquid to have completed first."
+    command -v jq >/dev/null || { echo "jq is required for the local-model check." >&2; exit 1; }
+    if ! "{{ ramalama_bin }}" --store "{{ ramalama_store }}" list --json | jq -e --arg repo "LiquidAI/LFM2.5-8B-A1B-GGUF" --arg tag "Q4_K_M" 'any(.[]; (.name | contains($repo)) and (.name | ascii_upcase | contains($tag)))' >/dev/null; then
+        echo "The Liquid Q4_K_M model is not fully local. Run ramalama-pull-liquid first." >&2
+        exit 1
+    fi
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c 2048 -n 24" "{{ ramalama_liquid }}" "Reply with exactly: Vulkan works."
+
+[doc('Run Qwen3.5 35B-A3B on Vulkan; an optional prompt follows the recipe name')]
+[group('RamaLama runs')]
+ramalama-run-qwen *prompt: _ramalama-require
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c {{ ramalama_context_tokens }}" "{{ ramalama_qwen }}" "$@"
+
+[doc('Run Ornith 1.5 on Vulkan; an optional prompt follows the recipe name')]
+[group('RamaLama runs')]
+ramalama-run-ornith *prompt: _ramalama-require
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c {{ ramalama_context_tokens }}" "{{ ramalama_ornith }}" "$@"
+
+[doc('Run Gemma 4 26B-A4B on Vulkan; an optional prompt follows the recipe name')]
+[group('RamaLama runs')]
+ramalama-run-gemma *prompt: _ramalama-require
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c {{ ramalama_context_tokens }}" "{{ ramalama_gemma }}" "$@"
+
+[doc('Run Laguna XS 2.1 on Vulkan; an optional prompt follows the recipe name')]
+[group('RamaLama runs')]
+ramalama-run-laguna *prompt: _ramalama-require
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c {{ ramalama_context_tokens }}" "{{ ramalama_laguna }}" "$@"
+
+[doc('Run Granite 4.2 8B on Vulkan; an optional prompt follows the recipe name')]
+[group('RamaLama runs')]
+ramalama-run-granite *prompt: _ramalama-require
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c {{ ramalama_context_tokens }}" "{{ ramalama_granite }}" "$@"
+
+[doc('Run Nemotron 3.5 Lightning on Vulkan; an optional prompt follows the recipe name')]
+[group('RamaLama runs')]
+ramalama-run-nemotron *prompt: _ramalama-require
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c {{ ramalama_context_tokens }}" "{{ ramalama_nemotron }}" "$@"
+
+[doc('Run Liquid LFM2.5 8B-A1B on Vulkan; an optional prompt follows the recipe name')]
+[group('RamaLama runs')]
+ramalama-run-liquid *prompt: _ramalama-require
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c {{ ramalama_context_tokens }}" "{{ ramalama_liquid }}" "$@"
+
+[doc('Run Cohere North Mini Code 1.0 on Vulkan; an optional prompt follows the recipe name')]
+[group('RamaLama runs')]
+ramalama-run-north *prompt: _ramalama-require
+    RAMALAMA_CONTAINER_ENGINE=podman "{{ ramalama_bin }}" --store "{{ ramalama_store }}" run --backend "{{ ramalama_backend }}" --ngl "{{ ramalama_ngl }}" --runtime-args="-c {{ ramalama_context_tokens }}" "{{ ramalama_north }}" "$@"

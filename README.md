@@ -219,6 +219,8 @@ Common setup commands:
 | Enable SSH | `ujust ssh-server enable` | Also opens the firewalld service |
 | Inspect Wake-on-LAN | `ujust wake-on-lan` | Lists candidate wired interfaces |
 | Inspect AI MAX profile | `ujust setup-ai-max status` | Refuses unsupported hardware |
+| Install RamaLama only | `ujust ramalama-setup` | User-local CLI; does not download models |
+| Install RamaLama and all models | `ujust ramalama-setup-all` | Requires at least 145 GiB free in the model store |
 
 See [the post-install profile guide](docs/post-install.md) for the full behavior
 and reversal instructions.

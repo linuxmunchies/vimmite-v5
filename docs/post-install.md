@@ -25,6 +25,27 @@ polkit rule, so a separate group change and logout are not required. The command
 also grants the `qemu` service account traversal-only access to your private
 home directory so ISO images selected from `~/Downloads` can be opened.
 
+## RamaLama
+
+```bash
+ujust ramalama-setup
+# or, to install the CLI and download every selected model:
+ujust ramalama-setup-all
+```
+
+Both options first check rootless Podman, Python, `jq`, and the AMD Vulkan
+environment. `ramalama-setup` creates a user-local virtual environment in
+`~/.local/share/ramalama-cli`, exposes `ramalama` through `~/.local/bin`, and
+does not download weights. `ramalama-setup-all` also pulls the selected GGUF
+models, which requires at least 145 GiB free in the model store (by default
+`~/ai/models`). Set `RAMALAMA_STORE=/path/on/a/large/disk` before
+running either command to relocate that store.
+
+Use an individual `ramalama-pull-*` recipe to download a model later. Run
+`ujust ramalama-list` to inspect local models and `ujust ramalama-smoke` after
+the Liquid model is present. `ujust --choose` groups the install, pull, and run
+helpers under RamaLama.
+
 ## Lossless Scaling
 
 The `lsfg-vk` layer is installed, but frame generation still requires the
