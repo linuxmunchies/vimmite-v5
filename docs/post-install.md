@@ -46,6 +46,21 @@ Use an individual `ramalama-pull-*` recipe to download a model later. Run
 the Liquid model is present. `ujust --choose` groups the install, pull, and run
 helpers under RamaLama.
 
+## Strix Halo local AI
+
+Ryzen AI MAX/`gfx1151` systems have a separate Distrobox-based llama.cpp path:
+
+```bash
+ujust strix-halo-ai
+```
+
+The single menu manages stable Vulkan RADV and ROCm toolboxes, downloads the
+selected Qwen and Muse GGUFs into the shared `~/ai/models` convention, installs
+host-facing llama.cpp commands, and runs GPU diagnostics. It refuses other AMD
+GPUs; use RamaLama on those systems. See the dedicated
+[Strix Halo AI guide](strix-halo-ai.md) for backend details, wrapper defaults,
+Pi Agent configuration, updates, removal, and troubleshooting.
+
 ## Lossless Scaling
 
 The `lsfg-vk` layer is installed, but frame generation still requires the

@@ -11,7 +11,7 @@ date for every run. Do not promote a build until the blocking checks pass.
       kernel, not an OGC/Bazzite kernel.
 - [x] Firefox is present; Gamescope and NVIDIA-specific packages are absent.
 - [ ] LACT, input-remapper, and their enabled services are present.
-- [ ] `brew` initializes successfully through BlueBuild's native module.
+- [ ] `brew` initializes successfully through BlueBuild's native module, including `hf --help`.
 - [ ] No EVDI or DisplayLink packages, modules, services, scripts, or helpers
       remain in the image.
 - [x] Steam, 32/64-bit MangoHud, controller rules, and `lsfg-vk` are present.
@@ -47,6 +47,22 @@ rebase.
 - [ ] Zsh/Zim setup preserves pre-existing dotfiles on a rerun.
 - [ ] Distrobox can create, enter, update, and remove a disposable test box.
 - [ ] No AI MAX TTM/GTT arguments appear on Ryzen 6550U or Intel systems.
+
+## Strix Halo local AI
+
+- [ ] `ujust strix-halo-ai` opens the 13-choice `ugum` menu.
+- [ ] Unsupported AMD hardware is refused unless the documented diagnostic override is set.
+- [ ] Vulkan uses `vulkan-radv`, `/dev/dri`, `keep-groups`, and unconfined seccomp.
+- [ ] ROCm uses `rocm-10.0`, `/dev/dri`, `/dev/kfd`, `keep-groups`, and unconfined seccomp.
+- [ ] Both `llama-cli --list-devices` calls report gfx1151/Radeon 8050S or 8060S.
+- [ ] Host and both containers see the same sentinel below `~/ai/models`.
+- [ ] Every host wrapper selects its intended backend and supplies overridable defaults.
+- [ ] A localhost llama-server responds from the host on a non-conflicting test port.
+- [ ] Bare Vulkan and ROCm server wrappers enter router mode rooted at `~/ai/models` and list the three managed IDs.
+- [ ] Qwen 3.6 and 3.8 use `draft-mtp` with `spec-draft-n-max = 3`; Muse has no MTP preset.
+- [ ] Update/recreate and Remove leave the model sentinel and downloaded weights intact.
+- [ ] Reinstall after removal restores the backend and host wrappers cleanly.
+- [ ] No host ROCm/llama.cpp package, udev mode rule, kernel argument, or BIOS change is introduced.
 
 ## Graphics and gaming
 

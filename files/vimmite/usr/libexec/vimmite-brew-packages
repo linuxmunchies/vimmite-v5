@@ -16,6 +16,7 @@ readonly formulae=(
   yt-dlp
   bbrew
   zoxide
+  hf
 )
 
 for formula in "${formulae[@]}"; do

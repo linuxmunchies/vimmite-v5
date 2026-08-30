@@ -62,7 +62,7 @@ applications later without expanding the base image.
 - DNF: Git, Vim, Neovim, Zsh, Zim, Kitty, Inxi, rsync, Smartmontools, NVMe CLI,
   lm_sensors, Rclone, tmux, tree, tldr, lsd, and Nerd Fonts
 - Homebrew: Bat, ncdu, fd, tealdeer, eza, jq, dust, procs, btop, yt-dlp,
-  bbrew, and zoxide
+  bbrew, zoxide, and Hugging Face's `hf` CLI
 - Podman, Distrobox, and Podman Compose
 - Zed from Flathub
 - QEMU/KVM, modular libvirt daemons, UEFI firmware, software TPM support, and
@@ -221,6 +221,7 @@ Common setup commands:
 | Inspect AI MAX profile | `ujust setup-ai-max status` | Refuses unsupported hardware |
 | Install RamaLama only | `ujust ramalama-setup` | User-local CLI; does not download models |
 | Install RamaLama and all models | `ujust ramalama-setup-all` | Requires at least 145 GiB free in the model store |
+| Manage Strix Halo local AI | `ujust strix-halo-ai` | Stable Vulkan/ROCm Distroboxes for gfx1151 only |
 
 See [the post-install profile guide](docs/post-install.md) for the full behavior
 and reversal instructions.
@@ -330,6 +331,8 @@ files/scripts/                   Pinned artifact and shell installers
 files/vimmite/                   Files copied into the primary image
 files/justfiles/vimmite.just     Vimmite V5 ujust commands
 docs/post-install.md             Optional profile instructions
+docs/strix-halo-ai.md            Strix Halo llama.cpp setup and troubleshooting
+docs/strix-halo-ai-configuration.md  Strix Halo server and model configuration
 docs/test-checklist.md           Physical acceptance checklist
 docs/architecture-proposal.md    Design and dependency rationale
 docs/investigation.md            Original live-system audit

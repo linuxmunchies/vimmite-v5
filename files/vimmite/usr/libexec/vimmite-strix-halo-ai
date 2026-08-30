@@ -1,0 +1,603 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly VULKAN_CONTAINER="strix-halo-vulkan"
+readonly VULKAN_IMAGE="docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv"
+readonly ROCM_CONTAINER="strix-halo-rocm"
+readonly ROCM_IMAGE="docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0"
+readonly MODEL_ROOT="${STRIX_HALO_AI_MODEL_ROOT:-${HOME}/ai/models}"
+readonly USER_BIN_DIR="${STRIX_HALO_AI_BIN_DIR:-${HOME}/.local/bin}"
+readonly USER_DATA_DIR="${STRIX_HALO_AI_DATA_DIR:-${HOME}/.local/share/strix-halo-ai}"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly WRAPPER_SOURCE="${SCRIPT_DIR}/vimmite-strix-halo-wrapper"
+readonly WRAPPER_RUNNER="${USER_DATA_DIR}/runner"
+readonly ROUTER_PRESETS_SOURCE="${SCRIPT_DIR}/vimmite-strix-halo-router-presets.ini"
+readonly ROUTER_PRESETS="${USER_DATA_DIR}/router-presets.ini"
+readonly HF_ENV="/opt/vimmite-strix-halo-hf"
+readonly HF_CLI="${HF_ENV}/bin/hf"
+
+readonly -a WRAPPERS=(
+    llama-vulkan
+    llama-server-vulkan
+    llama-rocm
+    llama-server-rocm
+    strix-vulkan-shell
+    strix-rocm-shell
+)
+
+log() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf 'WARNING: %s\n' "$*" >&2
+}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+have_container() {
+    podman container exists "$1" >/dev/null 2>&1
+}
+
+backend_container() {
+    case "$1" in
+        vulkan) printf '%s\n' "${VULKAN_CONTAINER}" ;;
+        rocm) printf '%s\n' "${ROCM_CONTAINER}" ;;
+        *) die "Unknown backend: $1" ;;
+    esac
+}
+
+backend_image() {
+    case "$1" in
+        vulkan) printf '%s\n' "${VULKAN_IMAGE}" ;;
+        rocm) printf '%s\n' "${ROCM_IMAGE}" ;;
+        *) die "Unknown backend: $1" ;;
+    esac
+}
+
+backend_flags() {
+    case "$1" in
+        vulkan)
+            printf '%s\n' '--device /dev/dri --group-add keep-groups --security-opt seccomp=unconfined'
+            ;;
+        rocm)
+            printf '%s\n' '--device /dev/dri --device /dev/kfd --group-add keep-groups --security-opt seccomp=unconfined'
+            ;;
+        *) die "Unknown backend: $1" ;;
+    esac
+}
+
+require_commands() {
+    local missing=0 command
+    for command in distrobox podman; do
+        if ! command -v "${command}" >/dev/null 2>&1; then
+            printf 'ERROR: %s is required but is not installed in the image.\n' "${command}" >&2
+            missing=1
+        fi
+    done
+    (( missing == 0 )) || die "Install the missing dependency through the BlueBuild image, not rpm-ostree layering."
+}
+
+strix_halo_pci_nodes() {
+    local device
+    for device in /sys/bus/pci/devices/*; do
+        [[ -r "${device}/vendor" && -r "${device}/device" ]] || continue
+        if [[ "$(<"${device}/vendor")" == "0x1002" && "$(<"${device}/device")" == "0x1586" ]]; then
+            printf '%s\n' "${device}"
+        fi
+    done
+}
+
+is_strix_halo() {
+    local pci_matches cpu_model
+    pci_matches="$(strix_halo_pci_nodes)"
+    cpu_model="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n1)"
+
+    # 1002:1586 is the Strix Halo display controller ID. Require the amdgpu
+    # driver when sysfs exposes it, and retain the CPU name as a second signal.
+    if [[ -n "${pci_matches}" ]]; then
+        local node driver
+        while IFS= read -r node; do
+            driver="$(basename "$(readlink -f "${node}/driver" 2>/dev/null || true)")"
+            if [[ "${driver}" == "amdgpu" && "${cpu_model}" == *"RYZEN AI MAX"* ]]; then
+                return 0
+            fi
+        done <<<"${pci_matches}"
+    fi
+    return 1
+}
+
+require_strix_halo() {
+    if is_strix_halo; then
+        return 0
+    fi
+    if [[ "${STRIX_HALO_AI_ALLOW_UNSUPPORTED:-0}" == "1" ]]; then
+        warn "Unsupported-hardware override is active (STRIX_HALO_AI_ALLOW_UNSUPPORTED=1)."
+        return 0
+    fi
+    die "No Strix Halo APU was recognized. This path requires AMD PCI ID 1002:1586, amdgpu, and a Ryzen AI MAX CPU. Use the RamaLama setup for other AMD GPUs. For development diagnostics only, set STRIX_HALO_AI_ALLOW_UNSUPPORTED=1."
+}
+
+user_has_group() {
+    local group_name="$1" group_gid
+    group_gid="$(getent group "${group_name}" | cut -d: -f3)"
+    [[ -n "${group_gid}" ]] || return 1
+    id -G | tr ' ' '\n' | grep -Fxq "${group_gid}"
+}
+
+readable_render_node() {
+    local node
+    for node in /dev/dri/renderD*; do
+        [[ -e "${node}" ]] || continue
+        [[ -r "${node}" && -w "${node}" ]] && return 0
+    done
+    return 1
+}
+
+require_device_access() {
+    local backend="$1"
+    [[ -d /dev/dri ]] || die "/dev/dri is absent; the AMD DRM driver is not exposing GPU devices."
+    readable_render_node || die "No /dev/dri/renderD* node is readable and writable by $(id -un). Add the user to render/video through the host's declarative configuration, then log out and back in. Do not use a world-writable udev workaround."
+    if [[ "${backend}" == "rocm" ]]; then
+        [[ -e /dev/kfd ]] || die "/dev/kfd is absent; ROCm compute cannot be exposed to the container."
+        [[ -r /dev/kfd && -w /dev/kfd ]] || die "/dev/kfd is not readable and writable by $(id -un). Add the user to render through the host's declarative configuration, then log out and back in."
+    fi
+}
+
+install_wrappers() {
+    [[ -x "${WRAPPER_SOURCE}" ]] || die "Image wrapper source is missing or not executable: ${WRAPPER_SOURCE}"
+    [[ -f "${ROUTER_PRESETS_SOURCE}" ]] || die "Image router preset source is missing: ${ROUTER_PRESETS_SOURCE}"
+    mkdir -p "${USER_DATA_DIR}" "${USER_BIN_DIR}"
+    install -m 0755 "${WRAPPER_SOURCE}" "${WRAPPER_RUNNER}"
+    install -m 0644 "${ROUTER_PRESETS_SOURCE}" "${ROUTER_PRESETS}"
+    if have_container "${VULKAN_CONTAINER}"; then
+        ln -sfn "${WRAPPER_RUNNER}" "${USER_BIN_DIR}/llama-vulkan"
+        ln -sfn "${WRAPPER_RUNNER}" "${USER_BIN_DIR}/llama-server-vulkan"
+        ln -sfn "${WRAPPER_RUNNER}" "${USER_BIN_DIR}/strix-vulkan-shell"
+    else
+        remove_backend_wrappers vulkan
+    fi
+    if have_container "${ROCM_CONTAINER}"; then
+        ln -sfn "${WRAPPER_RUNNER}" "${USER_BIN_DIR}/llama-rocm"
+        ln -sfn "${WRAPPER_RUNNER}" "${USER_BIN_DIR}/llama-server-rocm"
+        ln -sfn "${WRAPPER_RUNNER}" "${USER_BIN_DIR}/strix-rocm-shell"
+    else
+        remove_backend_wrappers rocm
+    fi
+    log "Host wrappers installed in ${USER_BIN_DIR}."
+    if [[ ":${PATH}:" != *":${USER_BIN_DIR}:"* ]]; then
+        warn "${USER_BIN_DIR} is not in PATH for this shell. Open a new Vimmite shell or add it to PATH."
+    fi
+}
+
+remove_backend_wrappers() {
+    local backend="$1" wrapper
+    local -a wrappers
+    case "${backend}" in
+        vulkan) wrappers=(llama-vulkan llama-server-vulkan strix-vulkan-shell) ;;
+        rocm) wrappers=(llama-rocm llama-server-rocm strix-rocm-shell) ;;
+        *) die "Unknown backend: ${backend}" ;;
+    esac
+    for wrapper in "${wrappers[@]}"; do
+        if [[ -L "${USER_BIN_DIR}/${wrapper}" && "$(readlink "${USER_BIN_DIR}/${wrapper}")" == "${WRAPPER_RUNNER}" ]]; then
+            rm -f -- "${USER_BIN_DIR}/${wrapper}"
+        fi
+    done
+}
+
+container_exec() {
+    local container="$1"
+    shift
+    distrobox enter --name "${container}" --no-tty -- "$@"
+}
+
+verify_backend() {
+    local backend="$1" container output
+    container="$(backend_container "${backend}")"
+    if ! have_container "${container}"; then
+        warn "${container} is not installed."
+        return 1
+    fi
+    log "${backend^^} llama.cpp devices:"
+    if ! output="$(container_exec "${container}" llama-cli --list-devices 2>&1)"; then
+        printf '%s\n' "${output}" >&2
+        warn "llama-cli --list-devices failed in ${container}."
+        return 1
+    fi
+    printf '%s\n' "${output}"
+    if ! grep -Eqi 'gfx1151|Radeon 80(50|60)S|Strix Halo' <<<"${output}"; then
+        warn "${container} did not identify the expected gfx1151/Radeon 8050S/8060S device."
+        return 1
+    fi
+}
+
+create_backend() {
+    local backend="$1" container image flags
+    require_commands
+    require_strix_halo
+    require_device_access "${backend}"
+    mkdir -p "${MODEL_ROOT}"
+    container="$(backend_container "${backend}")"
+    image="$(backend_image "${backend}")"
+    flags="$(backend_flags "${backend}")"
+
+    if have_container "${container}"; then
+        log "${container} already exists; leaving it intact. Use Update/recreate to replace it."
+        install_wrappers
+        verify_backend "${backend}"
+        return
+    fi
+
+    log "Pulling stable image ${image} ..."
+    podman pull "${image}"
+    log "Creating ${container} with rootless GPU group passthrough ..."
+    distrobox create \
+        --name "${container}" \
+        --image "${image}" \
+        --yes \
+        --no-entry \
+        --additional-flags "${flags}"
+    install_wrappers
+    verify_backend "${backend}"
+    container_exec "${container}" test -d "${MODEL_ROOT}" || die "${MODEL_ROOT} is not visible inside ${container}."
+    log "${container} is ready; shared models are visible at ${MODEL_ROOT}."
+}
+
+cleanup_old_repository_images() {
+    local repository='docker.io/kyuz0/amd-strix-halo-toolboxes' image_id image_ref
+    while read -r image_id image_ref; do
+        [[ "${image_ref}" == "${repository}:<none>" ]] || continue
+        podman image rm "${image_id}" >/dev/null 2>&1 || true
+    done < <(podman images --format '{{.ID}} {{.Repository}}:{{.Tag}}')
+}
+
+update_backend() {
+    local backend="$1" container image flags
+    require_commands
+    require_strix_halo
+    require_device_access "${backend}"
+    container="$(backend_container "${backend}")"
+    image="$(backend_image "${backend}")"
+    flags="$(backend_flags "${backend}")"
+    have_container "${container}" || die "${container} is not installed; choose Install instead."
+
+    mkdir -p "${MODEL_ROOT}"
+    log "Removing ${container}; ${MODEL_ROOT} will not be touched."
+    distrobox rm --force "${container}"
+    podman pull "${image}"
+    distrobox create \
+        --name "${container}" \
+        --image "${image}" \
+        --yes \
+        --no-entry \
+        --additional-flags "${flags}"
+    cleanup_old_repository_images
+    install_wrappers
+    verify_backend "${backend}"
+    container_exec "${container}" test -d "${MODEL_ROOT}" || die "${MODEL_ROOT} is not visible inside ${container}."
+    log "${container} was recreated from the latest stable tag; models were preserved."
+}
+
+remove_backend() {
+    local backend="$1" container
+    require_commands
+    container="$(backend_container "${backend}")"
+    if have_container "${container}"; then
+        distrobox rm --force "${container}"
+        log "Removed ${container}."
+    else
+        log "${container} is already absent."
+    fi
+    remove_backend_wrappers "${backend}"
+    log "Models remain untouched in ${MODEL_ROOT}."
+}
+
+ensure_hf_cli() {
+    local container="$1"
+    if container_exec "${container}" test -x "${HF_CLI}"; then
+        return 0
+    fi
+    log "The upstream image does not include hf; installing the current Hugging Face CLI in an isolated container-only environment."
+    # Podman can enter a rootless container as its namespaced root. This changes
+    # only the disposable Distrobox filesystem, never the immutable host.
+    podman exec --user 0 "${container}" python3 -m venv "${HF_ENV}"
+    podman exec --user 0 --env PIP_NO_CACHE_DIR=1 "${container}" "${HF_ENV}/bin/pip" install --upgrade 'huggingface_hub[hf_xet]'
+    container_exec "${container}" test -x "${HF_CLI}" || die "Failed to install the hf CLI inside ${container}."
+}
+
+artifact_is_complete() {
+    local destination="$1" expected_size="$2" expected_sha="$3" metadata
+    metadata="$(dirname "${destination}")/.cache/huggingface/download/$(basename "${destination}").metadata"
+    [[ -f "${destination}" && "$(stat -c %s "${destination}")" == "${expected_size}" ]] || return 1
+    [[ -f "${metadata}" && "$(sed -n '2p' "${metadata}")" == "${expected_sha}" ]]
+}
+
+download_models() {
+    require_commands
+    require_strix_halo
+    local downloader host_hf
+    if have_container "${VULKAN_CONTAINER}"; then
+        downloader="${VULKAN_CONTAINER}"
+    elif have_container "${ROCM_CONTAINER}"; then
+        downloader="${ROCM_CONTAINER}"
+    else
+        die "Install at least one Strix Halo toolbox before downloading models; its current 'hf' CLI performs resumable downloads."
+    fi
+    host_hf="$(command -v hf || true)"
+    if [[ -n "${host_hf}" ]]; then
+        log "Using image-managed Homebrew hf; destinations are under ${MODEL_ROOT}."
+    else
+        # Keep pre-existing deployments usable until they rebase to the image
+        # that supplies the managed Homebrew hf formula.
+        container_exec "${downloader}" true
+        ensure_hf_cli "${downloader}"
+        log "Using fallback hf in ${downloader}; destinations are under ${MODEL_ROOT}."
+    fi
+
+    # repo|file|directory|expected bytes|Xet SHA-256. These values are current
+    # Hugging Face object metadata and make integrity/disk checks reliable.
+    local -a artifacts=(
+        'unsloth/Qwen3.6-35B-A3B-MTP-GGUF|Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf|qwen3.6-35b-a3b|22853663008|55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1'
+        'unsloth/Qwen3.6-35B-A3B-MTP-GGUF|mmproj-F16.gguf|qwen3.6-35b-a3b|899283584|71f3cbc1f7cc0f30d09d41cfa924c0060827ebc33bf15ace7e86661e856f0160'
+        'unsloth/Muse-Glimmer-30B-GGUF|Muse-Glimmer-30B-UD-Q4_K_XL.gguf|muse-glimmer-30b|15878222368|82bece304887a313ece08400bc030f6066c7bff5b906b0cd40308ec8a409fd38'
+        'unsloth/Muse-Glimmer-30B-GGUF|mmproj-kquant.gguf|muse-glimmer-30b|1400328928|f48b452316f9b213758e8659444029b961a24a07f99a1abb2a9f88b06f7c00c6'
+        'unsloth/Qwen3.8-27B-GGUF|Qwen3.8-27B-UD-Q4_K_XL.gguf|qwen3.8-27b|17559178144|3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e'
+        'unsloth/Qwen3.8-27B-GGUF|mmproj-F16.gguf|qwen3.8-27b|927607488|cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e'
+    )
+    local row repo file directory expected expected_sha destination current remaining=0 available_bytes
+    mkdir -p "${MODEL_ROOT}"
+    for row in "${artifacts[@]}"; do
+        IFS='|' read -r repo file directory expected expected_sha <<<"${row}"
+        destination="${MODEL_ROOT}/${directory}/${file}"
+        current=0
+        [[ -f "${destination}" ]] && current="$(stat -c %s "${destination}")"
+        if (( current < expected )); then
+            remaining=$((remaining + expected - current))
+        elif (( current > expected )); then
+            warn "${destination} has an unexpected size and will be revalidated by hf."
+            remaining=$((remaining + expected))
+        fi
+    done
+    available_bytes=$(( $(df -Pk "${MODEL_ROOT}" | awk 'NR == 2 {print $4}') * 1024 ))
+    if (( available_bytes < remaining + 5 * 1024 * 1024 * 1024 )); then
+        die "Recommended models need about $(( (remaining + 1024 * 1024 * 1024 - 1) / 1024 / 1024 / 1024 )) GiB more payload space plus a 5 GiB safety margin; only $((available_bytes / 1024 / 1024 / 1024)) GiB is free."
+    fi
+
+    for row in "${artifacts[@]}"; do
+        IFS='|' read -r repo file directory expected expected_sha <<<"${row}"
+        destination="${MODEL_ROOT}/${directory}/${file}"
+        mkdir -p "${MODEL_ROOT}/${directory}"
+        if artifact_is_complete "${destination}" "${expected}" "${expected_sha}"; then
+            log "Reusing complete artifact: ${destination}"
+            continue
+        fi
+        log "Downloading/resuming ${repo}/${file} -> ${MODEL_ROOT}/${directory}/"
+        local -a env_args=(env HF_XET_HIGH_PERFORMANCE=1)
+        if [[ -n "${HF_TOKEN:-}" ]]; then
+            env_args+=("HF_TOKEN=${HF_TOKEN}")
+        fi
+        if [[ -n "${host_hf}" ]]; then
+            "${env_args[@]}" "${host_hf}" download "${repo}" "${file}" --local-dir "${MODEL_ROOT}/${directory}"
+        else
+            container_exec "${downloader}" "${env_args[@]}" "${HF_CLI}" download "${repo}" "${file}" --local-dir "${MODEL_ROOT}/${directory}"
+        fi
+        [[ -f "${destination}" ]] || die "hf finished without creating ${destination}."
+        [[ "$(stat -c %s "${destination}")" == "${expected}" ]] || die "${destination} does not match the expected upstream byte size; rerun to resume or inspect the Hugging Face repository for a changed artifact."
+        artifact_is_complete "${destination}" "${expected}" "${expected_sha}" || die "${destination} lacks matching Hugging Face SHA-256 metadata; rerun to revalidate it."
+    done
+    log "All recommended text models and compatible multimodal projectors are ready."
+}
+
+format_bytes_gib() {
+    awk -v bytes="$1" 'BEGIN {printf "%.1f GiB", bytes / 1024 / 1024 / 1024}'
+}
+
+show_memory_info() {
+    local node label value found=false
+    for node in /sys/class/drm/card*/device/mem_info_{gtt_total,vram_total,vis_vram_total}; do
+        [[ -r "${node}" ]] || continue
+        found=true
+        label="$(basename "${node}")"
+        value="$(<"${node}")"
+        printf '  %s: %s\n' "${label}" "$(format_bytes_gib "${value}")"
+    done
+    if [[ "${found}" == false ]]; then
+        log "  unavailable from amdgpu sysfs"
+    fi
+}
+
+verify_installation() {
+    local cpu gpu rootless path_status backend container image wrapper
+    cpu="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n1)"
+    gpu="$(lspci -nn 2>/dev/null | grep -Ei 'VGA|Display' | grep -i 'AMD' || true)"
+    log "Strix Halo AI verification"
+    log "=========================="
+    log "CPU: ${cpu:-unknown}"
+    log "AMD GPU: ${gpu:-not detected by lspci}"
+    if is_strix_halo; then
+        log "Hardware gate: PASS (AMD 1002:1586 + amdgpu + Ryzen AI MAX)"
+    else
+        warn "Hardware gate: FAIL; installers will stop unless the diagnostic override is set."
+    fi
+    log "Kernel: $(uname -r)"
+    log "User: $(id -un) (groups: $(id -nG))"
+    for group in render video; do
+        if user_has_group "${group}"; then
+            log "Host ${group} membership: yes"
+        else
+            warn "Host ${group} membership: no (device ACL/mode may still grant access)"
+        fi
+    done
+    [[ -d /dev/dri ]] && log "/dev/dri: present" || warn "/dev/dri: absent"
+    readable_render_node && log "DRM render node access: read/write" || warn "DRM render node access: missing"
+    if [[ -e /dev/kfd ]]; then
+        [[ -r /dev/kfd && -w /dev/kfd ]] && log "/dev/kfd: read/write" || warn "/dev/kfd: present but inaccessible"
+    else
+        warn "/dev/kfd: absent"
+    fi
+    log "Unified-memory information:"
+    show_memory_info
+    if command -v distrobox >/dev/null 2>&1; then
+        log "Distrobox: $(distrobox --version | head -n1)"
+    else
+        warn "Distrobox: missing"
+    fi
+    if command -v podman >/dev/null 2>&1; then
+        log "Podman: $(podman --version)"
+        rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+        log "Podman rootless: ${rootless:-unknown}"
+    else
+        warn "Podman: missing"
+        return 1
+    fi
+    [[ -d "${MODEL_ROOT}" ]] && log "Model directory: ${MODEL_ROOT} (present)" || warn "Model directory: ${MODEL_ROOT} (absent)"
+    if [[ ":${PATH}:" == *":${USER_BIN_DIR}:"* ]]; then path_status=in; else path_status='NOT in'; fi
+    log "User commands: ${USER_BIN_DIR} is ${path_status} PATH"
+    for wrapper in "${WRAPPERS[@]}"; do
+        [[ -x "${USER_BIN_DIR}/${wrapper}" ]] && log "  ${wrapper}: present" || warn "  ${wrapper}: missing"
+    done
+    for backend in vulkan rocm; do
+        container="$(backend_container "${backend}")"
+        if have_container "${container}"; then
+            image="$(podman inspect --format '{{.Config.Image}}' "${container}" 2>/dev/null || true)"
+            log "${container}: present (${image:-image unknown})"
+            if container_exec "${container}" test -d "${MODEL_ROOT}"; then
+                log "  shared model directory: visible"
+            else
+                warn "  shared model directory: not visible"
+            fi
+            verify_backend "${backend}" || true
+        else
+            log "${container}: absent"
+        fi
+    done
+    log "No kernel arguments or host configuration were changed."
+}
+
+show_help() {
+    cat <<EOF
+Strix Halo AI uses stable kyuz0 llama.cpp Distroboxes for gfx1151 only.
+
+Stable backends:
+  Vulkan  ${VULKAN_IMAGE}  (${VULKAN_CONTAINER})
+  ROCm    ${ROCM_IMAGE}  (${ROCM_CONTAINER})
+
+Models: ${MODEL_ROOT}
+Commands: llama-vulkan, llama-server-vulkan, llama-rocm,
+          llama-server-rocm, strix-vulkan-shell, strix-rocm-shell
+Defaults: --load-mode none -ngl 999 -fa 1
+Server: http://127.0.0.1:8080/v1 (unless --host/--port are supplied)
+
+The containers share the host HOME, so toolbox update/removal never removes
+models. Rootless Podman receives host supplementary groups with
+--group-add keep-groups; no MODE=0666 rule is installed.
+
+Developer-only hardware override:
+  STRIX_HALO_AI_ALLOW_UNSUPPORTED=1 ujust strix-halo-ai
+
+Documentation: https://github.com/linuxmunchies/vimmite-v5/blob/main/docs/strix-halo-ai.md
+EOF
+}
+
+run_both() {
+    local action="$1"
+    if [[ "${action}" == update ]]; then
+        local backend container found=false
+        for backend in vulkan rocm; do
+            container="$(backend_container "${backend}")"
+            if have_container "${container}"; then
+                found=true
+                update_backend "${backend}"
+            else
+                warn "${container} is not installed; skipping it."
+            fi
+        done
+        [[ "${found}" == true ]] || die "Neither Strix Halo toolbox is installed; choose Install both instead."
+        return 0
+    fi
+    "${action}_backend" vulkan
+    "${action}_backend" rocm
+}
+
+pause_menu() {
+    [[ -t 0 ]] || return 0
+    read -r -p "Press Enter to return to the menu..." _
+}
+
+menu() {
+    local -a choices=(
+        '1. Install Vulkan RADV'
+        '2. Install ROCm'
+        '3. Install both'
+        '4. Download recommended models'
+        '5. Update/recreate Vulkan'
+        '6. Update/recreate ROCm'
+        '7. Update/recreate both'
+        '8. Verify/test installation'
+        '9. Remove Vulkan'
+        '10. Remove ROCm'
+        '11. Remove both'
+        '12. Show configuration/help'
+        '13. Exit'
+    )
+    local selection number
+    while true; do
+        if command -v ugum >/dev/null 2>&1 && [[ -t 0 ]]; then
+            # Pass choices as arguments so ugum's gum, fzf, and plain-bash
+            # implementations all behave consistently on uBlue images.
+            selection="$(ugum choose "${choices[@]}")" || return 0
+            number="${selection%%.*}"
+        else
+            printf '\nStrix Halo local AI\n\n'
+            printf '  %s\n' "${choices[@]}"
+            read -r -p "Selection: " number
+        fi
+        case "${number}" in
+            1) create_backend vulkan ;;
+            2) create_backend rocm ;;
+            3) run_both create ;;
+            4) download_models ;;
+            5) update_backend vulkan ;;
+            6) update_backend rocm ;;
+            7) run_both update ;;
+            8) verify_installation ;;
+            9) remove_backend vulkan ;;
+            10) remove_backend rocm ;;
+            11) run_both remove ;;
+            12) show_help ;;
+            13) return 0 ;;
+            *) warn "Choose a number from 1 through 13." ;;
+        esac
+        pause_menu
+    done
+}
+
+usage() {
+    cat <<'EOF'
+Usage: vimmite-strix-halo-ai [menu|install|update|remove|download-models|verify|help] [vulkan|rocm|both]
+EOF
+}
+
+main() {
+    local action="${1:-menu}" target="${2:-}"
+    case "${action}" in
+        menu) menu ;;
+        install|update|remove)
+            [[ "${target}" =~ ^(vulkan|rocm|both)$ ]] || { usage >&2; exit 2; }
+            if [[ "${action}" == install ]]; then
+                action=create
+            fi
+            if [[ "${target}" == both ]]; then run_both "${action}"; else "${action}_backend" "${target}"; fi
+            ;;
+        download-models) download_models ;;
+        verify) verify_installation ;;
+        help) show_help ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

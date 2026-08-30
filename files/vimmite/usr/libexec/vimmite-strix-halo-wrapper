@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+command_name="$(basename "$0")"
+readonly MODEL_ROOT="${STRIX_HALO_AI_MODEL_ROOT:-${HOME}/ai/models}"
+readonly USER_DATA_DIR="${STRIX_HALO_AI_DATA_DIR:-${HOME}/.local/share/strix-halo-ai}"
+readonly ROUTER_PRESETS="${STRIX_HALO_AI_ROUTER_PRESETS:-${USER_DATA_DIR}/router-presets.ini}"
+case "${command_name}" in
+    llama-vulkan)
+        container="strix-halo-vulkan"
+        binary="llama-cli"
+        mode="llama"
+        ;;
+    llama-server-vulkan)
+        container="strix-halo-vulkan"
+        binary="llama-server"
+        mode="server"
+        ;;
+    llama-rocm)
+        container="strix-halo-rocm"
+        binary="llama-cli"
+        mode="llama"
+        ;;
+    llama-server-rocm)
+        container="strix-halo-rocm"
+        binary="llama-server"
+        mode="server"
+        ;;
+    strix-vulkan-shell)
+        exec distrobox enter --name strix-halo-vulkan
+        ;;
+    strix-rocm-shell)
+        exec distrobox enter --name strix-halo-rocm
+        ;;
+    *)
+        echo "Unknown Strix Halo wrapper name: ${command_name}" >&2
+        exit 2
+        ;;
+esac
+
+if ! command -v distrobox >/dev/null 2>&1 || ! command -v podman >/dev/null 2>&1; then
+    echo "Distrobox or Podman is unavailable. Run 'ujust strix-halo-ai' and choose Verify/test installation." >&2
+    exit 1
+fi
+if ! podman container exists "${container}" 2>/dev/null; then
+    echo "The ${container} Distrobox is not installed." >&2
+    echo "Run 'ujust strix-halo-ai' to install it." >&2
+    exit 1
+fi
+
+have_load_mode=false
+have_gpu_layers=false
+have_flash_attention=false
+have_host=false
+have_port=false
+have_model=false
+have_hf_repo=false
+have_models_dir=false
+have_models_preset=false
+have_spec_type=false
+have_spec_draft_n_max=false
+managed_qwen_mtp_model=false
+
+is_managed_qwen_mtp_model() {
+    local model_path="${1,,}"
+    [[ "${model_path}" == *qwen3.6* || "${model_path}" == *qwen3.8* ]]
+}
+
+arguments=("$@")
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+    argument="${arguments[index]}"
+    case "${argument}" in
+        -m|--model)
+            have_model=true
+            if (( index + 1 < ${#arguments[@]} )) && is_managed_qwen_mtp_model "${arguments[index + 1]}"; then
+                managed_qwen_mtp_model=true
+            fi
+            ;;
+        -m=*|--model=*)
+            have_model=true
+            is_managed_qwen_mtp_model "${argument#*=}" && managed_qwen_mtp_model=true
+            ;;
+        -hf|--hf-repo)
+            have_hf_repo=true
+            if (( index + 1 < ${#arguments[@]} )) && is_managed_qwen_mtp_model "${arguments[index + 1]}"; then
+                managed_qwen_mtp_model=true
+            fi
+            ;;
+        -hf=*|--hf-repo=*)
+            have_hf_repo=true
+            is_managed_qwen_mtp_model "${argument#*=}" && managed_qwen_mtp_model=true
+            ;;
+        --models-dir|--models-dir=*)
+            have_models_dir=true
+            ;;
+        --models-preset|--models-preset=*)
+            have_models_preset=true
+            ;;
+        --spec-type|--spec-type=*)
+            have_spec_type=true
+            ;;
+        --spec-draft-n-max|--spec-draft-n-max=*)
+            have_spec_draft_n_max=true
+            ;;
+    esac
+done
+
+for argument in "$@"; do
+    case "${argument}" in
+        --mmap|--no-mmap|--load-mode|--load-mode=*)
+            have_load_mode=true
+            ;;
+        -ngl|--gpu-layers|--n-gpu-layers|-ngl=*|--gpu-layers=*|--n-gpu-layers=*)
+            have_gpu_layers=true
+            ;;
+        -fa|--flash-attn|--flash-attention|-fa=*|--flash-attn=*|--flash-attention=*)
+            have_flash_attention=true
+            ;;
+        --host|--host=*)
+            have_host=true
+            ;;
+        --port|--port=*)
+            have_port=true
+            ;;
+    esac
+done
+
+defaults=()
+if [[ "${have_load_mode}" == false ]]; then
+    # --no-mmap is still accepted, but current llama.cpp names this mode
+    # explicitly and emits a deprecation warning for the old spelling.
+    defaults+=(--load-mode none)
+fi
+if [[ "${have_gpu_layers}" == false ]]; then
+    defaults+=(-ngl 999)
+fi
+if [[ "${have_flash_attention}" == false ]]; then
+    defaults+=(-fa 1)
+fi
+if [[ "${managed_qwen_mtp_model}" == true && "${have_spec_type}" == false ]]; then
+    defaults+=(--spec-type draft-mtp)
+    if [[ "${have_spec_draft_n_max}" == false ]]; then
+        defaults+=(--spec-draft-n-max 3)
+    fi
+fi
+if [[ "${mode}" == "server" ]]; then
+    if [[ ( "${command_name}" == "llama-server-vulkan" || "${command_name}" == "llama-server-rocm" ) && "${have_model}" == false && "${have_hf_repo}" == false && "${have_models_dir}" == false && "${have_models_preset}" == false ]]; then
+        defaults+=(--models-dir "${MODEL_ROOT}")
+        have_models_dir=true
+    fi
+    if [[ "${have_models_dir}" == true && "${have_models_preset}" == false ]]; then
+        if [[ -r "${ROUTER_PRESETS}" ]]; then
+            defaults+=(--models-preset "${ROUTER_PRESETS}")
+        else
+            echo "WARNING: Strix Halo router presets are unavailable at ${ROUTER_PRESETS}; Qwen MTP defaults will not apply in router mode." >&2
+        fi
+    fi
+    if [[ "${have_host}" == false ]]; then
+        defaults+=(--host 127.0.0.1)
+    fi
+    if [[ "${have_port}" == false ]]; then
+        defaults+=(--port 8080)
+    fi
+fi
+
+launch=(distrobox enter --name "${container}" -- "${binary}" "${defaults[@]}" "$@")
+if [[ "${STRIX_HALO_AI_DRY_RUN:-0}" == "1" ]]; then
+    printf '%q ' "${launch[@]}"
+    printf '\n'
+    exit 0
+fi
+exec "${launch[@]}"

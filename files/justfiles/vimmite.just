@@ -1,6 +1,11 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set positional-arguments
 
+[doc('Manage stable Vulkan and ROCm llama.cpp Distroboxes for Strix Halo/gfx1151')]
+[group('Strix Halo AI')]
+strix-halo-ai *args:
+    /usr/libexec/vimmite-strix-halo-ai "$@"
+
 [doc('Install the image-baked Zim setup without overwriting shell configuration')]
 [group('Vimmite')]
 setup-zsh set_login_shell="false":
