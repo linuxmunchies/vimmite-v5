@@ -15,9 +15,9 @@ install:
     - rclone
     - tmux
     - tree
-    - tldr
     - lsd
-
+    - btop
+    
     # Storage, health, and hardware diagnostics
     - rsync
     - smartmontools
