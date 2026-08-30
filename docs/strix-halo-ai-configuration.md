@@ -42,7 +42,7 @@ server process and take precedence over the setup defaults.
 | --- | --- | --- |
 | Context size | `-c 8192` | Maximum context per model/slot. Start modestly; larger contexts consume more unified memory. |
 | Parallel request slots | `-np 2` | Lets a model serve two concurrent requests. Each slot needs its own context/KV memory. |
-| Loaded router models | `--models-max 2` | Keeps at most two model instances resident at once. |
+| Loaded router models | `--models-max 2` | Keeps at most two model instances resident at once. The default is one. |
 | Server port | `--port 9000` | Uses a non-default local port. |
 | LAN binding | `--host 0.0.0.0 --port 9000` | Deliberately exposes the server beyond localhost. Review your firewall and authentication first. |
 | GPU layers | `-ngl 999` | Default is effectively all layers on the GPU. `-ngl 0` is a CPU-only diagnostic. |

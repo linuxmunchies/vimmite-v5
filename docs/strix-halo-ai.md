@@ -105,8 +105,10 @@ options win, including their long aliases. Both `llama-server-vulkan` and
 `llama-server-rocm` start in router mode by default with `--models-dir
 ~/ai/models`, so they list the downloaded `muse-glimmer-30b`,
 `qwen3.6-35b-a3b`, and `qwen3.8-27b` model IDs and load the requested model on
-demand. Supplying `-m`/`--model`, an HF repository, `--models-dir`, or
-`--models-preset` retains direct control instead.
+demand. Router mode defaults to `--models-max 1`, so loading a second model
+unloads the first and avoids keeping multiple large models resident. Supply
+`--models-max N` to choose another limit. Supplying `-m`/`--model`, an HF
+repository, `--models-dir`, or `--models-preset` retains direct control instead.
 
 The two bundled Qwen models are MTP-capable. Direct Qwen launches default to
 `--spec-type draft-mtp --spec-draft-n-max 3`; the managed router preset applies
