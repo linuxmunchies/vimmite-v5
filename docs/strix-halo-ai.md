@@ -42,7 +42,16 @@ ujust strix-halo-ai -- install vulkan
 ujust strix-halo-ai -- update both
 ujust strix-halo-ai -- remove rocm
 ujust strix-halo-ai -- download-models
+ujust strix-halo-ai -- stop both
+ujust strix-halo-ai -- version both
 ```
+
+`stop` defaults to both backends. It only terminates `llama-server` instances
+running in router mode, so a directly launched single-model server is left
+alone.
+
+`version` also defaults to both backends and reports the installed toolbox
+image together with each `llama-server` build version.
 
 ## Hardware and device checks
 

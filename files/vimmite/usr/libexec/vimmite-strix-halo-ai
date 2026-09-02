@@ -296,6 +296,77 @@ remove_backend() {
     log "Models remain untouched in ${MODEL_ROOT}."
 }
 
+router_pids() {
+    local container="$1"
+    container_exec "${container}" bash -c '
+        for proc in /proc/[0-9]*; do
+            [[ -r "${proc}/cmdline" ]] || continue
+            executable="$(basename "$(readlink -f "${proc}/exe" 2>/dev/null || true)")"
+            [[ "${executable}" == "llama-server" ]] || continue
+            command_line="$(tr "\\0" " " < "${proc}/cmdline")"
+            if [[ " ${command_line} " == *" --models-dir "* || " ${command_line} " == *" --models-dir="* ]]; then
+                printf "%s\\n" "${proc##*/}"
+            fi
+        done
+    '
+}
+
+stop_router_backend() {
+    local backend="$1" container attempt
+    local -a pids=()
+    require_commands
+    container="$(backend_container "${backend}")"
+    if ! have_container "${container}"; then
+        log "${container} is not installed; no router to stop."
+        return
+    fi
+    if [[ "$(podman inspect --format '{{.State.Running}}' "${container}" 2>/dev/null || true)" != "true" ]]; then
+        log "${container} is not running; no router to stop."
+        return
+    fi
+
+    mapfile -t pids < <(router_pids "${container}")
+    if (( ${#pids[@]} == 0 )); then
+        log "No ${backend} llama router is running."
+        return
+    fi
+
+    log "Stopping ${backend} llama router (PID(s): ${pids[*]}) ..."
+    if ! container_exec "${container}" kill -TERM "${pids[@]}"; then
+        warn "One or more ${backend} router processes had already exited."
+    fi
+    for attempt in {1..5}; do
+        sleep 1
+        mapfile -t pids < <(router_pids "${container}")
+        if (( ${#pids[@]} == 0 )); then
+            log "${backend^} llama router stopped; its model memory has been released."
+            return
+        fi
+    done
+
+    warn "${backend^} llama router did not exit after 5 seconds; force-stopping PID(s): ${pids[*]}."
+    container_exec "${container}" kill -KILL "${pids[@]}" || true
+    log "${backend^} llama router stopped; its model memory has been released."
+}
+
+show_llama_version_backend() {
+    local backend="$1" container image output
+    require_commands
+    container="$(backend_container "${backend}")"
+    if ! have_container "${container}"; then
+        log "${backend^}: ${container} is not installed."
+        return
+    fi
+    image="$(podman inspect --format '{{.Config.Image}}' "${container}" 2>/dev/null || true)"
+    log "${backend^} llama-server (${image:-image unknown}):"
+    if ! output="$(container_exec "${container}" llama-server --version 2>&1)"; then
+        printf '%s\n' "${output}" >&2
+        warn "Could not read the llama-server version in ${container}."
+        return
+    fi
+    sed 's/^/  /' <<<"${output}"
+}
+
 ensure_hf_cli() {
     local container="$1"
     if container_exec "${container}" test -x "${HF_CLI}"; then
@@ -491,6 +562,8 @@ Commands: llama-vulkan, llama-server-vulkan, llama-rocm,
           llama-server-rocm, strix-vulkan-shell, strix-rocm-shell
 Defaults: --load-mode none -ngl 999 -fa 1
 Server: http://127.0.0.1:8080/v1 (unless --host/--port are supplied)
+Stop router: ujust strix-halo-ai -- stop [vulkan|rocm|both]
+Llama version: ujust strix-halo-ai -- version [vulkan|rocm|both]
 
 The containers share the host HOME, so toolbox update/removal never removes
 models. Rootless Podman receives host supplementary groups with
@@ -541,8 +614,10 @@ menu() {
         '9. Remove Vulkan'
         '10. Remove ROCm'
         '11. Remove both'
-        '12. Show configuration/help'
-        '13. Exit'
+        '12. Stop running router(s)'
+        '13. Check installed llama version(s)'
+        '14. Show configuration/help'
+        '15. Exit'
     )
     local selection number
     while true; do
@@ -568,9 +643,11 @@ menu() {
             9) remove_backend vulkan ;;
             10) remove_backend rocm ;;
             11) run_both remove ;;
-            12) show_help ;;
-            13) return 0 ;;
-            *) warn "Choose a number from 1 through 13." ;;
+            12) run_both stop_router ;;
+            13) run_both show_llama_version ;;
+            14) show_help ;;
+            15) return 0 ;;
+            *) warn "Choose a number from 1 through 15." ;;
         esac
         pause_menu
     done
@@ -578,7 +655,7 @@ menu() {
 
 usage() {
     cat <<'EOF'
-Usage: vimmite-strix-halo-ai [menu|install|update|remove|download-models|verify|help] [vulkan|rocm|both]
+Usage: vimmite-strix-halo-ai [menu|install|update|remove|stop|version|download-models|verify|help] [vulkan|rocm|both]
 EOF
 }
 
@@ -591,7 +668,21 @@ main() {
             if [[ "${action}" == install ]]; then
                 action=create
             fi
-            if [[ "${target}" == both ]]; then run_both "${action}"; else "${action}_backend" "${target}"; fi
+            if [[ "${target}" == both ]]; then
+                run_both "${action}"
+            else
+                "${action}_backend" "${target}"
+            fi
+            ;;
+        stop)
+            target="${target:-both}"
+            [[ "${target}" =~ ^(vulkan|rocm|both)$ ]] || { usage >&2; exit 2; }
+            if [[ "${target}" == both ]]; then run_both stop_router; else stop_router_backend "${target}"; fi
+            ;;
+        version)
+            target="${target:-both}"
+            [[ "${target}" =~ ^(vulkan|rocm|both)$ ]] || { usage >&2; exit 2; }
+            if [[ "${target}" == both ]]; then run_both show_llama_version; else show_llama_version_backend "${target}"; fi
             ;;
         download-models) download_models ;;
         verify) verify_installation ;;

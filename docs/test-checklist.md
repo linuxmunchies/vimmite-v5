@@ -50,11 +50,12 @@ rebase.
 
 ## Strix Halo local AI
 
-- [ ] `ujust strix-halo-ai` opens the 13-choice `ugum` menu.
+- [ ] `ujust strix-halo-ai` opens the 15-choice `ugum` menu.
 - [ ] Unsupported AMD hardware is refused unless the documented diagnostic override is set.
 - [ ] Vulkan uses `vulkan-radv`, `/dev/dri`, `keep-groups`, and unconfined seccomp.
 - [ ] ROCm uses `rocm-10.0`, `/dev/dri`, `/dev/kfd`, `keep-groups`, and unconfined seccomp.
 - [ ] Both `llama-cli --list-devices` calls report gfx1151/Radeon 8050S or 8060S.
+- [ ] The version menu option reports the toolbox image and `llama-server` build for each installed backend.
 - [ ] Host and both containers see the same sentinel below `~/ai/models`.
 - [ ] Every host wrapper selects its intended backend and supplies overridable defaults.
 - [ ] A localhost llama-server responds from the host on a non-conflicting test port.

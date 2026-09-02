@@ -116,7 +116,9 @@ llama-server-rocm \
 ```
 
 The same command works with `llama-server-vulkan`. Stop the current server
-with `Ctrl+C`, then start it again after editing a preset.
+with `Ctrl+C`, or free memory from a detached router with
+`ujust strix-halo-ai -- stop [vulkan|rocm|both]`, then start it again after
+editing a preset.
 
 `[*]` is for settings shared by model instances; named sections use the router
 model IDs (`muse-glimmer-30b`, `qwen3.6-35b-a3b`, and `qwen3.8-27b`).
