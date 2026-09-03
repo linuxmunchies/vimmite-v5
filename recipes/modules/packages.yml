@@ -23,6 +23,8 @@ install:
     - smartmontools
     - nvme-cli
     - lm_sensors
+    - fuse
+    - fuse-libs
 
     # Media tools
     - vlc
